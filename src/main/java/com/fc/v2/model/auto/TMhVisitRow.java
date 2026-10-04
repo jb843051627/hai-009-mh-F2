@@ -16,15 +16,33 @@ import java.math.BigDecimal;
 import java.util.Date;
 
 /**
- * t_mh_visit_row 对象 t_mh_visit_row
+ * t_mh_visit_row 对象 t_mh_visit_row（急诊分诊单）
  *
  * @author fuce
  * @date 2026-09-14
  */
 @TableName("t_mh_visit_row")
-@ApiModel(value = "TMhVisitRow", description = "t_mh_visit_row")
+@ApiModel(value = "TMhVisitRow", description = "t_mh_visit_row 急诊分诊单")
 public class TMhVisitRow implements Serializable {
     private static final long serialVersionUID = 1L;
+
+    /** 级别常量：无可用标准（单上明写，不落级） */
+    public static final int LEVEL_NO_RULE = 0;
+    /** 级别：危重 */
+    public static final int LEVEL_CRITICAL = 1;
+    /** 级别：紧急 */
+    public static final int LEVEL_URGENT = 2;
+    /** 级别：普通 */
+    public static final int LEVEL_NORMAL = 3;
+    /** 级别：非急症 */
+    public static final int LEVEL_NON_URGENT = 4;
+
+    /** 情形：待复核 */
+    public static final int STATUS_PENDING = 0;
+    /** 情形：已复核（重判与原级别一致，封卷） */
+    public static final int STATUS_REVIEWED = 1;
+    /** 情形：退回重录 */
+    public static final int STATUS_REJECTED = 2;
 
     /** 主键 */
     @TableId(type = IdType.ASSIGN_ID)
@@ -32,29 +50,57 @@ public class TMhVisitRow implements Serializable {
     @ApiModelProperty(value = "主键")
     private Long id;
 
-    /** 门诊就诊数据上传批次号 */
-    @TableField("batch_no")
-    @ApiModelProperty(value = "门诊就诊数据上传批次号")
-    private String batchNo;
+    /** 分诊单号 */
+    @TableField("ticket_no")
+    @ApiModelProperty(value = "分诊单号")
+    private String ticketNo;
 
-    /** 原表行次 */
-    @TableField("row_no")
-    @ApiModelProperty(value = "原表行次")
-    private Integer rowNo;
+    /** 分诊途径（急诊/门诊/留观） */
+    @TableField("road")
+    @ApiModelProperty(value = "分诊途径（急诊/门诊/留观）")
+    private String road;
 
-    /** 被校验出的数据项代号 */
-    @TableField("item_code")
-    @ApiModelProperty(value = "被校验出的数据项代号")
-    private String itemCode;
+    /** 原始症状得分（护士录入，原样留档） */
+    @TableField("raw_score")
+    @ApiModelProperty(value = "原始症状得分（护士录入，原样留档）")
+    private BigDecimal rawScore;
 
-    /** 本行就诊费用 */
-    @TableField("qty")
-    @ApiModelProperty(value = "本行就诊费用")
-    private BigDecimal qty;
+    /** 系统判定级别 1危重 2紧急 3普通 4非急症 0无可用标准 */
+    @TableField("level_num")
+    @ApiModelProperty(value = "系统判定级别 1危重 2紧急 3普通 4非急症 0无可用标准")
+    private Integer levelNum;
 
-    /** 行落地情形 0待核 1已入库 2退回 */
+    /** 定级所用判定线代号（随后台回值落单，无标准时留空） */
+    @TableField("rule_code")
+    @ApiModelProperty(value = "定级所用判定线代号（随后台回值落单，无标准时留空）")
+    private String ruleCode;
+
+    /** 所用判定线的起用日（随线快照落单） */
+    @TableField("rule_eff_start")
+    @JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss", timezone = "GMT+8")
+    @ApiModelProperty(value = "所用判定线的起用日（随线快照落单）")
+    private Date ruleEffStart;
+
+    /** 分诊发生时点（按这一时刻选生效线，不按今天） */
+    @TableField("triage_at")
+    @JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss", timezone = "GMT+8")
+    @ApiModelProperty(value = "分诊发生时点（按这一时刻选生效线，不按今天）")
+    private Date triageAt;
+
+    /** 最近一次复查时点 */
+    @TableField("reviewed_at")
+    @JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss", timezone = "GMT+8")
+    @ApiModelProperty(value = "最近一次复查时点")
+    private Date reviewedAt;
+
+    /** 复查按单上线代号重判的级别（不改原级别） */
+    @TableField("review_level")
+    @ApiModelProperty(value = "复查按单上线代号重判的级别（不改原级别）")
+    private Integer reviewLevel;
+
+    /** 分诊单情形 0待复核 1已复核 2退回重录 */
     @TableField("status")
-    @ApiModelProperty(value = "行落地情形 0待核 1已入库 2退回")
+    @ApiModelProperty(value = "分诊单情形 0待复核 1已复核 2退回重录")
     private Integer status;
 
     /** 删除标记 0正常 1删除 */
@@ -84,9 +130,9 @@ public class TMhVisitRow implements Serializable {
     @ApiModelProperty(value = "更新时间")
     private Date updateTime;
 
-    /** 备注 */
+    /** 备注（无可用标准等在此明写） */
     @TableField("remark")
-    @ApiModelProperty(value = "备注")
+    @ApiModelProperty(value = "备注（无可用标准等在此明写）")
     private String remark;
 
     public Long getId() {
@@ -97,36 +143,76 @@ public class TMhVisitRow implements Serializable {
         this.id = id;
     }
 
-    public String getBatchNo() {
-        return batchNo;
+    public String getTicketNo() {
+        return ticketNo;
     }
 
-    public void setBatchNo(String batchNo) {
-        this.batchNo = batchNo;
+    public void setTicketNo(String ticketNo) {
+        this.ticketNo = ticketNo;
     }
 
-    public Integer getRowNo() {
-        return rowNo;
+    public String getRoad() {
+        return road;
     }
 
-    public void setRowNo(Integer rowNo) {
-        this.rowNo = rowNo;
+    public void setRoad(String road) {
+        this.road = road;
     }
 
-    public String getItemCode() {
-        return itemCode;
+    public BigDecimal getRawScore() {
+        return rawScore;
     }
 
-    public void setItemCode(String itemCode) {
-        this.itemCode = itemCode;
+    public void setRawScore(BigDecimal rawScore) {
+        this.rawScore = rawScore;
     }
 
-    public BigDecimal getQty() {
-        return qty;
+    public Integer getLevelNum() {
+        return levelNum;
     }
 
-    public void setQty(BigDecimal qty) {
-        this.qty = qty;
+    public void setLevelNum(Integer levelNum) {
+        this.levelNum = levelNum;
+    }
+
+    public String getRuleCode() {
+        return ruleCode;
+    }
+
+    public void setRuleCode(String ruleCode) {
+        this.ruleCode = ruleCode;
+    }
+
+    public Date getRuleEffStart() {
+        return ruleEffStart;
+    }
+
+    public void setRuleEffStart(Date ruleEffStart) {
+        this.ruleEffStart = ruleEffStart;
+    }
+
+    public Date getTriageAt() {
+        return triageAt;
+    }
+
+    public void setTriageAt(Date triageAt) {
+        this.triageAt = triageAt;
+    }
+
+    public Date getReviewedAt() {
+        return reviewedAt;
+    }
+
+    public void setReviewedAt(Date reviewedAt) {
+        this.reviewedAt = reviewedAt;
+    }
+
+    public Integer getReviewLevel() {
+        return reviewLevel;
+    }
+
+    public void setReviewLevel(Integer reviewLevel) {
+        this.reviewLevel = reviewLevel;
     }
 
     public Integer getStatus() {

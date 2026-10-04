@@ -42,31 +42,36 @@ public class TMhTriaRule implements Serializable {
     @ApiModelProperty(value = "判定线名")
     private String ruleName;
 
-    /** 危重档界值（含） */
+    /** 适用途径（急诊/门诊/留观等，空=不限途径） */
+    @TableField("apply_road")
+    @ApiModelProperty(value = "适用途径（急诊/门诊/留观等，空=不限途径）")
+    private String applyRoad;
+
+    /** 危重档界值（含），空=不设危重档 */
     @TableField("th1_max")
-    @ApiModelProperty(value = "危重档界值（含）")
+    @ApiModelProperty(value = "危重档界值（含），空=不设危重档")
     private BigDecimal th1Max;
 
-    /** 紧急档界值（含） */
+    /** 紧急档界值（含），空=不设紧急档 */
     @TableField("th2_max")
-    @ApiModelProperty(value = "紧急档界值（含）")
+    @ApiModelProperty(value = "紧急档界值（含），空=不设紧急档")
     private BigDecimal th2Max;
 
-    /** 普通档界值（含） */
+    /** 普通档界值（含），空=不设普通档 */
     @TableField("th3_max")
-    @ApiModelProperty(value = "普通档界值（含）")
+    @ApiModelProperty(value = "普通档界值（含），空=不设普通档")
     private BigDecimal th3Max;
 
-    /** 启用之日 */
+    /** 启用之日（含） */
     @TableField("eff_start")
     @JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss", timezone = "GMT+8")
     @ApiModelProperty(value = "启用之日")
     private Date effStart;
 
-    /** 交棒之日(不含) */
+    /** 交棒之日(不含)，空=长期有效 */
     @TableField("eff_end")
     @JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss", timezone = "GMT+8")
-    @ApiModelProperty(value = "交棒之日(不含)")
+    @ApiModelProperty(value = "交棒之日(不含)，空=长期有效")
     private Date effEnd;
 
     /** 判定线顺位(数值大的先说话) */
@@ -133,6 +138,14 @@ public class TMhTriaRule implements Serializable {
 
     public void setRuleName(String ruleName) {
         this.ruleName = ruleName;
+    }
+
+    public String getApplyRoad() {
+        return applyRoad;
+    }
+
+    public void setApplyRoad(String applyRoad) {
+        this.applyRoad = applyRoad;
     }
 
     public BigDecimal getTh1Max() {

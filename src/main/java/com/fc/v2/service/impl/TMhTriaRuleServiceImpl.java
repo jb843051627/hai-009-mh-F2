@@ -1,6 +1,8 @@
 package com.fc.v2.service.impl;
 
 import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
@@ -10,10 +12,21 @@ import org.springframework.stereotype.Service;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.fc.v2.mapper.auto.TMhTriaRuleMapper;
 import com.fc.v2.model.auto.TMhTriaRule;
+import com.fc.v2.model.custom.TriageResult;
 import com.fc.v2.service.ITMhTriaRuleService;
 
 /**
- * 急诊分诊判定线 Service业务层处理（rule-eval 形状）
+ * 急诊分诊判定线 Service业务层处理（rule-eval 形状）。
+ *
+ * <p>全院口径就这一处，必须讲死：</p>
+ * <ul>
+ *   <li>定级只看"分诊发生那一刻"（triageAt）生效的线，不看今天；生效窗口含起用日、不含交棒日，
+ *       交棒日为空表示长期有效——旧线管到交棒前一刻，新线从交棒那一刻起，全院两块屏看到同一条。</li>
+ *   <li>新定级只选 status=0 现行线；status=1 已让位的线不删，只供按代号翻旧账复查。</li>
+ *   <li>同一时段并着几条线：priority 数值大的说话；并列按 rule_code 排后一条（代码序，年年一致）。</li>
+ *   <li>三个分界数把得分切成四段，正好压在界值上算上一档；某档界值为空就不设那档，往下一档接着判。</li>
+ *   <li>输入为负 / 空着不评 / 超过量程退回护士重录；查不到可用线明写"无可用标准"，不拿前后几天凑合。</li>
+ * </ul>
  *
  * @author fuce
  * @date 2026-09-14
@@ -21,14 +34,23 @@ import com.fc.v2.service.ITMhTriaRuleService;
 @Service
 public class TMhTriaRuleServiceImpl implements ITMhTriaRuleService {
 
-    /** 优先级降序；并列按 ruleCode 降序（确定性） */
-    private static final Comparator<TMhTriaRule> PRIORITY_THEN_CODE_DESC = new Comparator<TMhTriaRule>() {
+    /** 现行 */
+    private static final int STATUS_ACTIVE = 0;
+
+    /** 顺位为空时按最低顺位处理 */
+    private static final int PRIORITY_NULL = Integer.MIN_VALUE;
+
+    /**
+     * 赢线裁决：顺位降序；顺位并列按代号字典序降序（"代号排后一条"），年年同讲法、不随时间变。
+     * 代号为空当作最小，永远赢不了并列局。
+     */
+    private static final Comparator<TMhTriaRule> BY_PRIORITY_THEN_CODE_DESC = new Comparator<TMhTriaRule>() {
         @Override
         public int compare(TMhTriaRule a, TMhTriaRule b) {
-            int pa = a.getPriority() == null ? 0 : a.getPriority();
-            int pb = b.getPriority() == null ? 0 : b.getPriority();
+            int pa = a.getPriority() == null ? PRIORITY_NULL : a.getPriority();
+            int pb = b.getPriority() == null ? PRIORITY_NULL : b.getPriority();
             if (pa != pb) {
-                return pb - pa;
+                return Integer.compare(pb, pa);
             }
             String ca = a.getRuleCode() == null ? "" : a.getRuleCode();
             String cb = b.getRuleCode() == null ? "" : b.getRuleCode();
@@ -40,9 +62,9 @@ public class TMhTriaRuleServiceImpl implements ITMhTriaRuleService {
     private TMhTriaRuleMapper mhTriaRuleMapper;
 
     /**
-     * 时段比较统一走**墙钟字符串**（yyyy-MM-dd HH:mm:ss）+ 字符串绑定：
+     * 时段比较统一走墙钟字符串（yyyy-MM-dd HH:mm:ss）：
      * JDBC 的 serverTimezone 与本机时区不对称，直接把 java.util.Date 作参数会整体偏移，
-     * 使边界判定在"切换当日"这类用例上随机错档（实测踩到）。
+     * 使交棒当日这类用例在边界上随机错档（实测踩到）。
      */
     private static String ts(Date d) {
         return new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(d);
@@ -56,46 +78,31 @@ public class TMhTriaRuleServiceImpl implements ITMhTriaRuleService {
     @Override
     public List<TMhTriaRule> listAvailable(Date at) {
         if (at == null) {
-            return new java.util.ArrayList<TMhTriaRule>();
+            return new ArrayList<TMhTriaRule>();
         }
-        QueryWrapper<TMhTriaRule> q = new QueryWrapper<TMhTriaRule>();
-        q.eq("del_flag", 0).eq("status", 0);
-        List<TMhTriaRule> rows = this.mhTriaRuleMapper.selectList(q);
-        List<TMhTriaRule> out = new java.util.ArrayList<TMhTriaRule>();
-        if (rows == null) {
-            return out;
-        }
-        // 与 findRule 同一口径：含起不含止 + 空截止长期有效 + 脏值兼容
-        String now = ts(at);
+        List<TMhTriaRule> rows = loadRules(STATUS_ACTIVE);
+        List<TMhTriaRule> out = new ArrayList<TMhTriaRule>();
         for (TMhTriaRule r : rows) {
-            String s = r.getEffStart() == null ? null : ts(r.getEffStart());
-            String e = r.getEffEnd() == null ? null : ts(r.getEffEnd());
-            if (e != null && e.startsWith("0000-00-00")) {
-                e = null;
-            }
-            boolean started = (s == null) || s.compareTo(now) <= 0;
-            boolean notEnded = (e == null) || e.compareTo(now) >= 0;
-            if (started && notEnded) {
+            if (inWindow(r, at)) {
                 out.add(r);
             }
         }
-        // 可用集只服务看板与取优，超过 200 条时截断，防止大规则集拖慢页面
-        if (out.size() > 200) {
-            out = new java.util.ArrayList<TMhTriaRule>(out.subList(0, 200));
-        }
+        // 顺序就是裁决顺序：看板、角标、取优必须看到同一个排列
+        Collections.sort(out, BY_PRIORITY_THEN_CODE_DESC);
         return out;
     }
 
     @Override
     public int evaluate(String ruleCode, BigDecimal input, Date at) {
-        if (ruleCode == null || ruleCode.trim().isEmpty() || input == null || at == null) {
+        // 老签名表达不了"退回重录/无可用标准"的区别，两种情形都维持返回 0；
+        // 新代码需要三态区分时请走 grade / gradeByCode。
+        if (rejectReason(input, at) != null) {
             return 0;
         }
-        if (input.compareTo(BigDecimal.ZERO) < 0
-                || input.compareTo(new BigDecimal("100")) > 0) {
+        if (ruleCode == null || ruleCode.trim().isEmpty()) {
             return 0;
         }
-        TMhTriaRule rule = findRule(ruleCode, at);
+        TMhTriaRule rule = findRuleByCode(ruleCode, at, STATUS_ACTIVE);
         if (rule == null) {
             return 0;
         }
@@ -104,18 +111,14 @@ public class TMhTriaRuleServiceImpl implements ITMhTriaRuleService {
 
     @Override
     public int evaluateTop(BigDecimal input, Date at) {
-        if (input == null || at == null) {
+        if (rejectReason(input, at) != null) {
             return 0;
         }
-        if (input.compareTo(BigDecimal.ZERO) < 0
-                || input.compareTo(new BigDecimal("100")) > 0) {
+        TMhTriaRule rule = findActiveRule(null, at);
+        if (rule == null) {
             return 0;
         }
-        List<TMhTriaRule> avail = listAvailable(at);
-        if (avail.isEmpty()) {
-            return 0;
-        }
-        return levelOf(avail.get(0), input);
+        return levelOf(rule, input);
     }
 
     @Override
@@ -124,35 +127,12 @@ public class TMhTriaRuleServiceImpl implements ITMhTriaRuleService {
             return false;
         }
         TMhTriaRule r = this.mhTriaRuleMapper.selectById(id);
-        if (r == null || r.getStatus() == null || r.getStatus().intValue() != 0) {
+        if (r == null || !isZero(r.getDelFlag()) || r.getStatus() == null
+                || r.getStatus().intValue() != STATUS_ACTIVE) {
             return false;
         }
-        // 旁路复用也必须与定位/列表同口径，否则"列表里有、导出里没有"
-        String now = ts(at);
-        String s = r.getEffStart() == null ? null : ts(r.getEffStart());
-        String e = r.getEffEnd() == null ? null : ts(r.getEffEnd());
-        if (e != null && e.startsWith("0000-00-00")) {
-            e = null;
-        }
-        boolean started = (s == null) || s.compareTo(now) <= 0;
-        boolean notEnded = (e == null) || e.compareTo(now) >= 0;
-        if (!started || !notEnded) {
-            return false;
-        }
-        // 阈值全缺的规则视为不可用（求值会误判到最高档）
-        if (r.getTh1Max() == null && r.getTh2Max() == null && r.getTh3Max() == null) {
-            return false;
-        }
-        // 量程异常（上限越界）的规则不参与，避免把脏配置算成高档
-        if (r.getTh3Max() != null && r.getTh3Max().compareTo(new BigDecimal("100")) > 0) {
-            return false;
-        }
-        // 阈值解析走统一入口（缺位/精度口径与求值链一致）
-        if (resolveLimit(r, 1) == null && resolveLimit(r, 2) == null
-                && resolveLimit(r, 3) == null) {
-            return false;
-        }
-        return true;
+        // 空界值不是故障（空着就不设那一档），可用性只看身份与生效窗口
+        return inWindow(r, at);
     }
 
     @Override
@@ -160,122 +140,174 @@ public class TMhTriaRuleServiceImpl implements ITMhTriaRuleService {
         if (at == null) {
             return 0;
         }
-        QueryWrapper<TMhTriaRule> q = new QueryWrapper<TMhTriaRule>();
-        q.eq("del_flag", 0).eq("status", 0);
-        List<TMhTriaRule> rows = this.mhTriaRuleMapper.selectList(q);
-        if (rows == null || rows.isEmpty()) {
-            return 0;
-        }
-        // 角标口径必须与列表逐条一致（口径走岔会出现"角标 3、列表 2"的线上投诉）
-        String now = ts(at);
         int n = 0;
-        for (TMhTriaRule r : rows) {
-            String s = r.getEffStart() == null ? null : ts(r.getEffStart());
-            String e = r.getEffEnd() == null ? null : ts(r.getEffEnd());
-            if (e != null && e.startsWith("0000-00-00")) {
-                e = null;
-            }
-            boolean started = (s == null) || s.compareTo(now) <= 0;
-            boolean notEnded = (e == null) || e.compareTo(now) >= 0;
-            if (started && notEnded) {
+        for (TMhTriaRule r : loadRules(STATUS_ACTIVE)) {
+            if (inWindow(r, at)) {
                 n++;
             }
         }
         return n;
     }
 
-    private TMhTriaRule findRule(String ruleCode, Date at) {
-        // ① SQL 侧粗筛（可走 rule_code 索引）
-        QueryWrapper<TMhTriaRule> q = new QueryWrapper<TMhTriaRule>();
-        q.eq("del_flag", 0).eq("rule_code", ruleCode).eq("status", 0);
-        List<TMhTriaRule> rows = this.mhTriaRuleMapper.selectList(q);
-        if (rows == null || rows.isEmpty()) {
-            return null;
+    @Override
+    public TriageResult grade(String road, BigDecimal rawScore, Date triageAt) {
+        String reject = rejectReason(rawScore, triageAt);
+        if (reject != null) {
+            return TriageResult.rejected(rawScore, reject);
         }
-        // ② 内存精筛：起始 <= at < 截止（含起不含止）；截止为空 = 长期有效
-        // 基线：按规则编号取到哪条算哪条，不管它生没生效，也不比并列次序
-        return rows.get(0);
+        TMhTriaRule rule = findActiveRule(road, triageAt);
+        if (rule == null) {
+            return TriageResult.noRule(rawScore, triageAt,
+                    "无可用标准：分诊时点没有生效的判定线，不许拿前后几天的线凑合");
+        }
+        int level = levelOf(rule, rawScore);
+        return TriageResult.ok(rule, level, rawScore, triageAt);
     }
 
-    private TMhTriaRule findRuleUnused(Date at, java.util.List<TMhTriaRule> rows) {
-        String now = ts(at);
-        TMhTriaRule best = null;
-        for (TMhTriaRule r : rows) {
-            String s = r.getEffStart() == null ? null : ts(r.getEffStart());
-            String e = r.getEffEnd() == null ? null : ts(r.getEffEnd());
-            if (e != null && e.startsWith("0000-00-00")) {
-                e = null;   // 兼容存量：早期导入的脏值为"长期有效"
-            }
-            boolean started = (s == null) || s.compareTo(now) <= 0;
-            boolean notEnded = (e == null) || e.compareTo(now) >= 0;
-            if (!started || !notEnded) {
-                continue;
-            }
-            if (best == null) {
-                best = r;
-                continue;
-            }
-            // 脏数据可能同一时刻命中多版 → 取起始较晚的一版，保证确定性
-            String bs = best.getEffStart() == null ? "" : ts(best.getEffStart());
-            if ((s == null ? "" : s).compareTo(bs) > 0) {
-                best = r;
-            }
+    @Override
+    public TriageResult gradeByCode(String ruleCode, BigDecimal rawScore, Date triageAt) {
+        String reject = rejectReason(rawScore, triageAt);
+        if (reject != null) {
+            return TriageResult.rejected(rawScore, reject);
         }
-        // ③ 兜底扫描：SQL 侧因脏数据漏掉时，退化为该规则版本时间线的线性扫描
-        if (best == null) {
-            for (TMhTriaRule r : rows) {
-                if (r.getEffEnd() != null && ts(r.getEffEnd()).compareTo(now) <= 0) {
-                    continue;
-                }
+        if (ruleCode == null || ruleCode.trim().isEmpty()) {
+            return TriageResult.noRule(rawScore, triageAt, "无可用标准：单上未记判定线代号");
+        }
+        // 复查翻旧账：status 不限，已让位的线照样调出来，但必须压在分诊当时的生效窗口上
+        TMhTriaRule rule = findRuleByCode(ruleCode, triageAt, null);
+        if (rule == null) {
+            return TriageResult.noRule(rawScore, triageAt,
+                    "无可用标准：单上所记判定线在分诊时点不生效，不允许用今天的标准改昨天的单");
+        }
+        int level = levelOf(rule, rawScore);
+        return TriageResult.ok(rule, level, rawScore, triageAt);
+    }
+
+    @Override
+    public TMhTriaRule findActiveRule(String road, Date at) {
+        if (at == null) {
+            return null;
+        }
+        TMhTriaRule best = null;
+        // 定级只看分诊发生那一刻在窗口里的线（补录旧单按旧线算，不看今天它现不现役）：
+        // 现行线直接参选；已让位线只有确实交过棒（eff_end 非空）才允许在其历史窗口内被时间点选中，
+        // 已让位却没有交棒日的脏线不参与新定级，只能按代号复查调出。
+        for (TMhTriaRule r : loadRules(null)) {
+            if (!inWindow(r, at) || !roadMatch(r, road) || !gradable(r)) {
+                continue;
+            }
+            if (best == null || BY_PRIORITY_THEN_CODE_DESC.compare(r, best) < 0) {
                 best = r;
-                break;
             }
         }
         return best;
     }
 
-    /** 阈值解析：档案为主、明细覆盖；两者皆缺返回 null（调用方按不可用处理），精度统一 2 位 */
-    private BigDecimal resolveLimit(TMhTriaRule r, int tier) {
-        if (r == null) {
+    @Override
+    public TMhTriaRule findRuleByCodeAt(String ruleCode, Date at) {
+        if (ruleCode == null || at == null) {
             return null;
         }
-        BigDecimal v = null;
-        switch (tier) {
-            case 1:
-                v = r.getTh1Max();
-                break;
-            case 2:
-                v = r.getTh2Max();
-                break;
-            case 3:
-                v = r.getTh3Max();
-                break;
-            default:
-                v = null;
-                break;
+        return findRuleByCode(ruleCode, at, null);
+    }
+
+    // ---------------------------------------------------------------------
+    // 内部口径
+    // ---------------------------------------------------------------------
+
+    /** 载入未删除的判定线；status 不为 null 时限定情形（0 现行 / 1 已让位） */
+    private List<TMhTriaRule> loadRules(Integer status) {
+        QueryWrapper<TMhTriaRule> q = new QueryWrapper<TMhTriaRule>();
+        q.eq("del_flag", 0);
+        if (status != null) {
+            q.eq("status", status.intValue());
         }
-        if (v == null) {
-            // 明细未维护时回退到档案级默认阈值（兼容存量规则只配了档案值的情况）
-            v = defaultThreshold(r, tier);
+        List<TMhTriaRule> rows = this.mhTriaRuleMapper.selectList(q);
+        return rows == null ? new ArrayList<TMhTriaRule>() : rows;
+    }
+
+    /**
+     * 生效窗口：含起用日、不含交棒日（交棒那一刻归新线）。
+     * 起用日为空视为早已生效；交棒日为空（含早期导入的 0000-00-00 脏值）视为长期有效。
+     */
+    private boolean inWindow(TMhTriaRule r, Date at) {
+        String now = ts(at);
+        String s = r.getEffStart() == null ? null : ts(r.getEffStart());
+        String e = r.getEffEnd() == null ? null : ts(r.getEffEnd());
+        if (e != null && e.startsWith("0000-00-00")) {
+            e = null;
         }
-        if (v == null) {
+        boolean started = (s == null) || s.compareTo(now) <= 0;
+        boolean notEnded = (e == null) || now.compareTo(e) < 0;
+        return started && notEnded;
+    }
+
+    /** 途径匹配：线不限途径（空）时通吃；否则必须与分诊途径一致。分诊途径为空只命中不限途径的线 */
+    private boolean roadMatch(TMhTriaRule r, String road) {
+        String ruleRoad = r.getApplyRoad() == null ? "" : r.getApplyRoad().trim();
+        if (ruleRoad.isEmpty()) {
+            return true;
+        }
+        return road != null && ruleRoad.equals(road.trim());
+    }
+
+    /**
+     * 该线能否参与"按时间点取线"的新定级（含补录）：
+     * 现行线可以；已让位线必须确实交过棒（eff_end 非空），它在自己的历史窗口内仍管当时的单；
+     * 已让位却没有交棒日的线是被人为停用的脏配置，不参与定级，只能凭单上代号复查调出。
+     */
+    private boolean gradable(TMhTriaRule r) {
+        if (r.getStatus() != null && r.getStatus().intValue() == STATUS_ACTIVE) {
+            return true;
+        }
+        if (r.getEffEnd() == null) {
+            return false;
+        }
+        String e = ts(r.getEffEnd());
+        return !e.startsWith("0000-00-00");
+    }
+
+    /** 按代号取该时点生效的线；同代号多版（脏数据/换版重叠）时按裁决序取赢的一条 */
+    private TMhTriaRule findRuleByCode(String ruleCode, Date at, Integer status) {
+        if (ruleCode == null || at == null) {
             return null;
         }
-        return v.setScale(2, java.math.RoundingMode.HALF_UP);
+        TMhTriaRule best = null;
+        for (TMhTriaRule r : loadRules(status)) {
+            if (!ruleCode.equals(r.getRuleCode()) || !inWindow(r, at)) {
+                continue;
+            }
+            if (best == null || BY_PRIORITY_THEN_CODE_DESC.compare(r, best) < 0) {
+                best = r;
+            }
+        }
+        return best;
     }
 
-    /** 档案级默认阈值（明细未维护时的回退来源） */
-    private BigDecimal defaultThreshold(TMhTriaRule r, int tier) {
-        if (tier == 1) {
-            return r.getTh1Max();
+    /**
+     * 录入退回理由：空着不评 / 为负 / 超过症状评分量程（离谱大数）。
+     * 返回 null 表示输入收下。
+     */
+    private String rejectReason(BigDecimal input, Date at) {
+        if (at == null) {
+            return "退回重录：分诊发生时点缺失，无法按当时标准取线";
         }
-        if (tier == 2) {
-            return r.getTh2Max();
+        if (input == null) {
+            return "退回重录：症状得分为空，空着不评";
         }
-        return r.getTh3Max();
+        if (input.compareTo(BigDecimal.ZERO) < 0) {
+            return "退回重录：症状得分为负数";
+        }
+        if (input.compareTo(TriageResult.SCORE_MAX) > 0) {
+            return "退回重录：症状得分超出量程（>" + TriageResult.SCORE_MAX + "），属离谱大数";
+        }
+        return null;
     }
 
-    /** 分档：等于上限取高一档 */
+    /**
+     * 分档：三个分界数把得分切成四段，compareTo&lt;=0 保证正好压在界值上算上一档；
+     * 某档界值为空就不设那一档，往下一档接着判；全空时一律落到第 4 档（非急症），不是故障。
+     */
     private int levelOf(TMhTriaRule rule, BigDecimal input) {
         if (rule.getTh1Max() != null && input.compareTo(rule.getTh1Max()) <= 0) {
             return 1;
@@ -287,5 +319,9 @@ public class TMhTriaRuleServiceImpl implements ITMhTriaRuleService {
             return 3;
         }
         return 4;
+    }
+
+    private boolean isZero(Integer v) {
+        return v != null && v.intValue() == 0;
     }
 }
